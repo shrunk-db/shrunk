@@ -796,8 +796,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let retention = policy.map(|policy| policy.start(state.clone()));
     let stop_retention = retention.as_ref().map(|(stop, _)| stop.clone());
     let shutdown_executor = state.executor.clone();
-    let result = axum::serve(listener, app(state.clone()))
-        .with_graceful_shutdown(async move {
+    listener
+        .serve(app(state.clone()), async move {
             shutdown_signal().await;
             // Stop all producers at signal time. Existing HTTP bodies may
             // finish reading, but cannot submit new database commands.
@@ -817,7 +817,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The dedicated worker drains accepted commands and then checkpoints,
     // including running mutations whose clients disconnected.
     let drained = worker.finish().await;
-    result?;
     retention_result?;
     drained.map_err(|e| e.2)?;
     Ok(())

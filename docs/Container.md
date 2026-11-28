@@ -121,8 +121,8 @@ Unknown JSON fields are rejected. Validation errors use HTTP 400, unknown series
 404, missing/incorrect tokens 401, oversized bodies 413, incorrect content types
 415, and unavailable admission or an expired queued operation 503 with
 `Retry-After: 1`. A 503 means that database operation never started; it is safe
-to retry that operation. Once execution starts, the server waits for its actual
-result even if the queue deadline passes. API errors use
+to retry that operation. The queue deadline stops applying once execution
+starts. An open connection waits for the operation's actual result. API errors use
 `{"error":{"code":"...","message":"..."}}`. Routing/method errors may use the
 HTTP framework's default response. Server-side I/O failures return 500 and log
 details to stderr. There is no request/body/token logging.
@@ -152,10 +152,14 @@ operations still use one writer and there is no distributed load balancer.
 `SHRUNK_MAX_CONNECTIONS` caps accepted socket lifetimes (default 16), including
 idle keep-alive sockets, partial headers, body reads, and slow response readers.
 Overflow sockets are closed without an HTTP response. A connection keeps its
-slot until its IO is dropped, so slow clients cannot accumulate unlimited
-response buffers. All three settings must be positive integers; invalid values
-fail startup. Compose forwards them. A reverse proxy may still need its own
-connection, request, and timeout policy.
+slot until its socket closes. The server allows 10 seconds to receive complete
+request headers, including the wait for the next request on a keep-alive
+connection. Each socket closes after at most 60 seconds from acceptance,
+including during a slow request or response. A database operation already
+running can still commit after its connection expires. All three admission
+settings must be positive integers. Invalid values fail startup. Compose
+forwards them. A reverse proxy may still need its own connection, request, and
+timeout policy.
 
 Authenticated `GET /v1/status` reads only atomics and stays independent of the
 database queue. It reports active/max connections, queued/running operations,
