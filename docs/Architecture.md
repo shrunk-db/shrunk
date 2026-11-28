@@ -46,6 +46,11 @@ Every block header also stores:
 Each block costs 58 bytes for its header and checksums, plus the payload. That
 is negligible for a 1024-point block and noticeable for a three-point series.
 
+Opening a snapshot checks the decoded points against the metadata before
+queries and lifecycle operations can use it. V3 validation decodes one block at
+a time and keeps the block index in memory. Queries continue to read the
+compressed payloads from disk as needed.
+
 ## Query path
 
 `query` and `aggregate` do this per block:

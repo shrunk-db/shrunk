@@ -80,7 +80,7 @@ cargo build --release
 
 ## Whole-file results
 
-`bench` includes ingest, an atomic snapshot, lazy open, a full scan, a metadata
+`bench` includes ingest, an atomic snapshot, snapshot open, a full scan, a metadata
 aggregate, and a filtered query. "Before" is `docs/BASELINE.md`.
 
 | pattern | before bits/pt | after bits/pt | before file | after file | after ratio | after open |
@@ -98,9 +98,9 @@ codec can remove. The constant series is slightly larger than the baseline
 because the v3 block header carries a separate header CRC and the file header is
 larger; RLE still wins the payload by a wide margin.
 
-Peak RSS for the whole `bench` process was 42-50 MiB. `open` no longer reads
-payloads, so open time is 1-2 ms even at one million points (nonconstant baseline
-8-54 ms).
+Peak RSS for the whole `bench` process was 42-50 MiB. The recorded open times of
+1-2 ms predate open-time payload validation. Current opens read and decode the
+payloads one block at a time.
 
 ## Per-codec results (payload only)
 
@@ -140,7 +140,8 @@ when at least 8% of adjacent XORs can take the skip path.
   `t_min <= t_max`, non-NaN value bounds, `v_min <= v_max` when `has_nan` is
   false, finite stored sums, codec id known.
 - v3 stores a CRC over the block header and a separate CRC over the payload.
-  `open` validates headers; queries validate payloads lazily.
+  `open` checks both CRCs and verifies metadata against decoded points. Queries
+  check each payload CRC when they read it from disk.
 - v1 and v2 decoders are retained. Saving upgrades a legacy database to the
   current format.
 - `FORMAT_VERSION` is the single source of truth. The magic is derived as

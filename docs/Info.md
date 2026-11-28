@@ -273,16 +273,17 @@ per series:
     u32 crc32(payload)
 ```
 
-The separate header and payload checksums make lazy open safe. `open`
-reads and validates every block header without touching payloads. A query reads
-one payload with `pread` and checks its CRC before decoding. A corrupt header
-or payload is rejected instead of being interpreted as data. These checksums
-detect accidental corruption; they do not authenticate files. Legacy v1
-headers have no checksum, so v1 query metadata is re-derived from decoded
-payloads before queries can use it. Legacy v1/v2 snapshots remain readable;
-v1 whole-file loading has a 256 MiB read budget. Current snapshots have a
-one-million-block index budget and a 64 GiB file-size ceiling; each block's
-payload is limited to 64 MiB.
+Opening a snapshot checks its checksums and decodes each block before its
+metadata can be used. For v2 and v3, open checks timestamp order and requires
+the point count, bounds, NaN flag, and sum to agree with the decoded points.
+V1 uses metadata derived from its decoded, checksummed payloads. The legacy
+v1/v2 whole-file read budget is 256 MiB.
+
+V3 verification reads one block at a time and retains file offsets in the
+index. When a query reads a payload, it checks the payload's CRC again before
+decoding. CRCs detect accidental corruption and provide no file authentication.
+Current snapshots have a one-million-block index budget and a 64 GiB file-size
+ceiling. Each block's payload is limited to 64 MiB.
 
 ### Write-ahead log
 

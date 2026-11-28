@@ -58,8 +58,8 @@ fn verify(raw_path: &str, block_path: &str) {
     assert_eq!(&block[54..block.len() - 4], expected);
     assert_eq!(codec.decode(&expected, points.len()).unwrap(), points);
 
-    // Wrap the emitted block in a real v3 snapshot. Db::open verifies the
-    // header CRC/metadata; query verifies the payload CRC and decodes it.
+    // Wrap the emitted block in a real v3 snapshot so Db::open verifies the
+    // checksums and checks the metadata against the decoded points.
     let mut snapshot = Vec::new();
     snapshot.extend(FORMAT_MAGIC);
     snapshot.extend(FORMAT_VERSION.to_le_bytes());

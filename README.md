@@ -104,8 +104,6 @@ the label on the box.
   replication, clustering, or SQL.
 - It is not lossless magic for every data set. Noisy floating point sensors get
   about 2x. Integer counters and flat signals get 10x to 200x.
-- It does not load every payload on open. `open` reads metadata only and reads a
-  block's compressed bytes when a query needs them.
 - It is a small project meant to be read, run, and extended.
 
 ## Documentation
@@ -152,8 +150,8 @@ These are deliberate for a small project:
   multi-writer coordination or general transaction API.
 - A checkpoint rewrites the whole snapshot. Incremental appends avoid that cost
   until you checkpoint, but the snapshot itself is still a full rewrite.
-- `open` reads metadata only, but the block index for every series is held in
-  memory. The payloads are read lazily.
+- `open` reads and validates the snapshot one block at a time. For v3,
+  the block index stays in memory and queries read payloads from disk as needed.
 - Deletes and retention rewrite snapshots. Retention windows are applied
   explicitly using caller-supplied event time; the HTTP service also supports
   an opt-in policy using its wall clock, disabled by default.
