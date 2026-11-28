@@ -109,14 +109,21 @@ pub struct Block {
     pub has_nan: bool,
     pub sum: Option<f64>,
     pub payload: Payload,
-    /// Expected payload-only CRC from a v3 file. Checked lazily on decode.
+    /// Expected payload-only CRC from a v3 file. Checked on open and decode.
     pub payload_crc: Option<u32>,
 }
 
-impl Block {
-    pub fn build(points: &[Point]) -> Block {
-        assert!(!points.is_empty(), "cannot build an empty block");
+struct BlockMetadata {
+    t_min: i64,
+    t_max: i64,
+    v_min: f64,
+    v_max: f64,
+    has_nan: bool,
+    sum: Option<f64>,
+}
 
+impl BlockMetadata {
+    fn from_points(points: &[Point]) -> Self {
         let mut t_min = points[0].ts;
         let mut t_max = points[0].ts;
         let mut v_min = f64::INFINITY;
@@ -141,6 +148,28 @@ impl Block {
                 }
             }
         }
+
+        Self {
+            t_min,
+            t_max,
+            v_min,
+            v_max,
+            has_nan,
+            // A sum over finite values can overflow. Store it only when both
+            // the inputs and the result are finite.
+            sum: if all_finite && sum.is_finite() {
+                Some(sum)
+            } else {
+                None
+            },
+        }
+    }
+}
+
+impl Block {
+    pub fn build(points: &[Point]) -> Block {
+        assert!(!points.is_empty(), "cannot build an empty block");
+        let metadata = BlockMetadata::from_points(points);
 
         let mut best_codec = Codec::Raw;
         let mut best_size = points.len() * 16;
@@ -180,18 +209,12 @@ impl Block {
         Block {
             codec: best_codec,
             count: points.len() as u32,
-            t_min,
-            t_max,
-            v_min,
-            v_max,
-            has_nan,
-            // Sum can overflow to infinity for huge finite inputs. Treat that
-            // as "no trusted sum" rather than persisting an unusable value.
-            sum: if all_finite && sum.is_finite() {
-                Some(sum)
-            } else {
-                None
-            },
+            t_min: metadata.t_min,
+            t_max: metadata.t_max,
+            v_min: metadata.v_min,
+            v_max: metadata.v_max,
+            has_nan: metadata.has_nan,
+            sum: metadata.sum,
             payload: Payload::Memory(
                 best.unwrap_or_else(|| Codec::Raw.encode(points).expect("raw always encodes")),
             ),
@@ -199,8 +222,7 @@ impl Block {
         }
     }
 
-    /// Check metadata read from disk before it can influence query planning.
-    /// Payload bytes are not decoded here.
+    /// Check structural limits and invariants without decoding the payload.
     pub fn validate_meta(&self) -> Result<(), String> {
         if self.count == 0 {
             return Err("block with zero points".into());
@@ -267,24 +289,62 @@ impl Block {
 
     pub fn decode(&self) -> Result<Vec<Point>, String> {
         self.validate_meta()?;
-        let points = self.payload.with_bytes(|bytes| {
-            if let Some(expected) = self.payload_crc {
-                let actual = crc32(bytes);
-                if actual != expected {
-                    return Err(format!(
-                        "payload checksum mismatch: stored {expected:#010x}, got {actual:#010x}"
-                    ));
-                }
+        self.payload
+            .with_bytes(|bytes| self.decode_payload(bytes))?
+    }
+
+    fn decode_payload(&self, bytes: &[u8]) -> Result<Vec<Point>, String> {
+        if let Some(expected) = self.payload_crc {
+            let actual = crc32(bytes);
+            if actual != expected {
+                return Err(format!(
+                    "payload checksum mismatch: stored {expected:#010x}, got {actual:#010x}"
+                ));
             }
-            self.codec.decode(bytes, self.count as usize)
-        })??;
+        }
+        let points = self.codec.decode(bytes, self.count as usize)?;
         self.validate_decoded(&points)?;
         Ok(points)
     }
 
-    /// Verify that a payload's decoded contents agree with the header that was
-    /// used to plan the query. This catches corruption that a payload CRC
-    /// cannot catch in legacy files, and metadata/codec disagreements.
+    /// Decode a snapshot payload and verify the metadata used by shortcuts.
+    /// Call after checking structural limits with `validate_meta`.
+    pub(crate) fn validate_snapshot_payload(&self, bytes: &[u8]) -> Result<(), String> {
+        let points = self.decode_payload(bytes)?;
+        let metadata = BlockMetadata::from_points(&points);
+        if self.t_min != metadata.t_min || self.t_max != metadata.t_max {
+            return Err("block time bounds do not match payload".into());
+        }
+        // Equal signed zeros can differ across historical encoders and
+        // implementations of f64::min/max. The bounds are numerically equal.
+        if self.v_min != metadata.v_min || self.v_max != metadata.v_max {
+            return Err("block value bounds do not match payload".into());
+        }
+        if self.has_nan != metadata.has_nan {
+            return Err("block NaN flag does not match payload".into());
+        }
+        if self.sum.map(f64::to_bits) != metadata.sum.map(f64::to_bits) {
+            return Err("block sum does not match payload".into());
+        }
+        Ok(())
+    }
+
+    /// V1 checksums cover only the payload. Use content-derived metadata for
+    /// compatibility with v1's recovery behavior.
+    pub(crate) fn refresh_v1_metadata(&mut self) -> Result<(), String> {
+        let points = self.decode()?;
+        let metadata = BlockMetadata::from_points(&points);
+        self.t_min = metadata.t_min;
+        self.t_max = metadata.t_max;
+        self.v_min = metadata.v_min;
+        self.v_max = metadata.v_max;
+        self.has_nan = metadata.has_nan;
+        self.sum = metadata.sum;
+        Ok(())
+    }
+
+    /// Check point count, timestamp order, and containment within the header
+    /// bounds. A NaN point requires the header's NaN flag to be set.
     pub fn validate_decoded(&self, points: &[Point]) -> Result<(), String> {
         if points.len() != self.count as usize {
             return Err(format!(

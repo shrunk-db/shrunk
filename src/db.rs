@@ -57,8 +57,7 @@ const VERSION_V2: u16 = 2;
 ///
 /// * v1: original snapshot, CRC over payload only.
 /// * v2: format header, CRC over block metadata plus payload.
-/// * v3: separate header CRC and payload CRC, so open validates metadata
-///   without reading payloads and query validates payloads lazily.
+/// * v3: separate header CRC and payload CRC with file-backed payloads.
 pub const FORMAT_VERSION: u16 = 3;
 pub const FORMAT_MAGIC: [u8; 8] = magic_for(FORMAT_VERSION);
 const MAGIC_V1: [u8; 8] = magic_for(VERSION_V1);
@@ -1125,8 +1124,10 @@ impl Db {
         self.save(&path)
     }
 
-    /// Open a snapshot and replay any WAL. The returned handle is not bound
-    /// for further appends; use [`Db::open_rw`] for that.
+    /// Open and validate a snapshot and replay any WAL. The returned handle
+    /// is not bound for further appends; use [`Db::open_rw`] for that.
+    /// Snapshot validation decodes one block at a time and retains v3
+    /// payloads on disk for subsequent reads.
     ///
     /// The snapshot and WAL identities are re-checked after the read. If a
     /// concurrent writer checkpoints or appends mid-open, the open is retried
@@ -1641,8 +1642,6 @@ fn write_db(db: &Db, out: &mut impl Write) -> Result<()> {
                     header.extend_from_slice(&b.v_max.to_le_bytes());
                     header.extend_from_slice(&b.sum.unwrap_or(f64::NAN).to_le_bytes());
                     header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                    // Header CRC lets `open` validate query-planning metadata without
-                    // reading any payload bytes.
                     let header_crc = crc32(&header);
                     out.write_all(&header)?;
                     out.write_all(&header_crc.to_le_bytes())?;
@@ -1690,65 +1689,8 @@ fn decode_v1(data: &[u8]) -> Result<Db> {
     let block_size = c.u32()? as usize;
     let series_count = c.u32()? as usize;
     let mut db = decode_body(&mut c, data, block_size, series_count, false)?;
-    reverify_v1_metadata(&mut db)?;
     db.format_version = VERSION_V1;
     Ok(db)
-}
-
-// v1 checksums cover only payloads. Recompute planning metadata from those
-// payloads before queries can trust it.
-fn reverify_v1_metadata(db: &mut Db) -> Result<()> {
-    for (name, series) in &mut db.series {
-        for block in &mut series.blocks {
-            let points = block
-                .decode()
-                .map_err(|e| Error::Format(format!("series {name:?}: invalid v1 payload: {e}")))?;
-            let first = points
-                .first()
-                .ok_or_else(|| Error::Format("empty v1 block".into()))?;
-            let mut v_min = f64::INFINITY;
-            let mut v_max = f64::NEG_INFINITY;
-            let mut has_nan = false;
-            let mut finite = true;
-            let mut sum = 0.0;
-            for p in &points {
-                if p.value.is_nan() {
-                    has_nan = true;
-                    finite = false;
-                } else {
-                    v_min = v_min.min(p.value);
-                    v_max = v_max.max(p.value);
-                    if p.value.is_finite() {
-                        sum += p.value;
-                    } else {
-                        finite = false;
-                    }
-                }
-            }
-            block.t_min = first.ts;
-            block.t_max = points.last().unwrap().ts;
-            block.v_min = v_min;
-            block.v_max = v_max;
-            block.has_nan = has_nan;
-            block.sum = if finite && sum.is_finite() {
-                Some(sum)
-            } else {
-                None
-            };
-            block.validate_meta().map_err(Error::Format)?;
-        }
-        let mut prev = None;
-        for block in &series.blocks {
-            if prev.is_some_and(|end| block.t_min <= end) {
-                return Err(Error::Format(format!(
-                    "series {name:?}: overlapping v1 blocks"
-                )));
-            }
-            prev = Some(block.t_max);
-        }
-        series.last_ts = prev;
-    }
-    Ok(())
 }
 
 fn decode_v2(data: &[u8]) -> Result<Db> {
@@ -1773,8 +1715,7 @@ fn decode_v2(data: &[u8]) -> Result<Db> {
     Ok(db)
 }
 
-/// Parse a v3 file lazily. Only block headers and series metadata are read;
-/// payloads stay on disk until a query decodes the block.
+/// Verify a v3 file block by block and retain only the index in memory.
 fn decode_current_file(file: File, len: u64) -> Result<Db> {
     let file = Arc::new(file);
     let mut c = FileCursor::new(file, len, 8);
@@ -1905,10 +1846,7 @@ fn read_current_block(c: &mut FileCursor, name: &str) -> Result<Block> {
             crate::block::MAX_PAYLOAD_BYTES
         )));
     }
-    let offset = c.pos;
-    c.skip(payload_len as u64)?;
-    let payload_crc = c.u32()?;
-    let block = Block {
+    let mut block = Block {
         codec,
         count,
         t_min,
@@ -1919,13 +1857,18 @@ fn read_current_block(c: &mut FileCursor, name: &str) -> Result<Block> {
         sum: if flags & 1 != 0 { Some(raw_sum) } else { None },
         payload: Payload::File {
             file: c.file.clone(),
-            offset,
+            offset: c.pos,
             len: payload_len as u32,
         },
-        payload_crc: Some(payload_crc),
+        payload_crc: None,
     };
     block
         .validate_meta()
+        .map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
+    let payload = c.take(payload_len)?;
+    block.payload_crc = Some(c.u32()?);
+    block
+        .validate_snapshot_payload(&payload)
         .map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
     Ok(block)
 }
@@ -2045,21 +1988,21 @@ fn read_block(c: &mut Cursor<'_>, data: &[u8], name: &str, v2_crc: bool) -> Resu
             crate::block::MAX_PAYLOAD_BYTES
         )));
     }
-    let payload = c.take(payload_len)?.to_vec();
+    let payload = c.take(payload_len)?;
     let crc = c.u32()?;
     let calculated = if v2_crc {
         // `c.pos` is just past the CRC, so the covered region ends 4 bytes
         // before it and starts at the block's first header byte.
         crc32(&data[start..c.pos - 4])
     } else {
-        crc32(&payload)
+        crc32(payload)
     };
     if calculated != crc {
         return Err(Error::Format(format!(
             "checksum mismatch in series {name:?}"
         )));
     }
-    let block = Block {
+    let mut block = Block {
         codec,
         count,
         t_min,
@@ -2068,12 +2011,17 @@ fn read_block(c: &mut Cursor<'_>, data: &[u8], name: &str, v2_crc: bool) -> Resu
         v_max,
         has_nan: flags & 2 != 0,
         sum: if flags & 1 != 0 { Some(raw_sum) } else { None },
-        payload: Payload::Memory(payload),
+        payload: Payload::Memory(payload.to_vec()),
         payload_crc: None,
     };
-    block
-        .validate_meta()
-        .map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
+    let result = if v2_crc {
+        block
+            .validate_meta()
+            .and_then(|()| block.validate_snapshot_payload(payload))
+    } else {
+        block.refresh_v1_metadata()
+    };
+    result.map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
     Ok(block)
 }
 
@@ -2149,17 +2097,6 @@ impl FileCursor {
             filled += take;
         }
         Ok(out)
-    }
-
-    fn skip(&mut self, n: u64) -> Result<()> {
-        if n > self.remaining() {
-            return Err(Error::Format(format!(
-                "truncated at byte {} (wanted to skip {n})",
-                self.pos
-            )));
-        }
-        self.pos += n;
-        Ok(())
     }
 
     fn u16(&mut self) -> Result<u16> {
@@ -2504,15 +2441,18 @@ mod tests {
     }
 
     #[test]
-    fn v1_sum_is_derived_from_payload_not_mutable_header() {
+    fn v1_metadata_is_derived_from_payload_before_indexing() {
         let mut data = include_bytes!("../tests/fixtures/v1.shrunk").to_vec();
         let first_block = 8 + 4 + 4 + 4 + 7 + 4;
+        data[first_block + 14..first_block + 22].copy_from_slice(&i64::MAX.to_le_bytes());
         data[first_block + 38..first_block + 46].copy_from_slice(&9999.0f64.to_le_bytes());
         let db = decode_v1(&data).unwrap();
         let points = db
             .query(&Query::new("fixture", i64::MIN, i64::MAX))
             .unwrap()
             .points;
+        let first = &db.series["fixture"].blocks[0];
+        assert_eq!(first.t_max, points[first.count as usize - 1].ts);
         let expected: f64 = points
             .iter()
             .filter(|p| p.value.is_finite())
@@ -2524,6 +2464,72 @@ mod tests {
             .value
             .unwrap();
         assert!((actual - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn v2_open_checks_metadata_after_the_block_checksum() {
+        let mut data = include_bytes!("../tests/fixtures/v2.shrunk").to_vec();
+        let first_block = 20 + 4 + "fixture".len() + 4;
+        let payload_len =
+            u32::from_le_bytes(data[first_block + 46..first_block + 50].try_into().unwrap())
+                as usize;
+        let payload_end = first_block + 50 + payload_len;
+        data[first_block + 38..first_block + 46].copy_from_slice(&9999.0f64.to_le_bytes());
+        let checksum = crc32(&data[first_block..payload_end]);
+        data[payload_end..payload_end + 4].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            decode_v2(&data),
+            Err(Error::Format(message)) if message.contains("block sum does not match payload")
+        ));
+    }
+
+    #[test]
+    fn v3_open_rejects_inconsistent_checked_blocks() {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-block-metadata-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("db.shrunk");
+
+        let points = [
+            Point::new(10, 0.5),
+            Point::new(20, 0.5),
+            Point::new(30, 0.5),
+        ];
+        let mut db = Db::with_block_size(points.len());
+        db.write_many("s", &points).unwrap();
+        let mut valid = db.series["s"].blocks[0].clone();
+        valid.codec = Codec::Rle;
+        valid.payload = Payload::Memory(valid.codec.encode(&points).unwrap());
+        type Change = (&'static str, fn(&mut Block));
+        let changes: &[Change] = &[
+            ("time bounds", |block| block.t_min -= 1),
+            ("time bounds", |block| block.t_max += 1),
+            ("value bounds", |block| block.v_min = 0.0),
+            ("value bounds", |block| block.v_max = 1.0),
+            ("NaN flag", |block| block.has_nan = true),
+            ("block sum", |block| block.sum = Some(0.0)),
+            ("block sum", |block| block.sum = None),
+            ("count", |block| block.count -= 1),
+            ("timestamp", |block| {
+                *block = Block::build(&[Point::new(20, 0.5), Point::new(10, 0.5)]);
+            }),
+        ];
+        for &(expected, change) in changes {
+            let block = &mut db.series.get_mut("s").unwrap().blocks[0];
+            *block = valid.clone();
+            change(block);
+            fs::write(&path, encode_db(&db).unwrap()).unwrap();
+            for result in [Db::open(&path), Db::open_rw(&path)] {
+                assert!(
+                    matches!(&result, Err(Error::Format(message)) if message.contains(expected)),
+                    "expected {expected:?}, got {result:?}"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

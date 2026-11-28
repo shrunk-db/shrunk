@@ -228,14 +228,17 @@ fn corrupt_payload_is_rejected() {
     let mut db = Db::with_block_size(64);
     db.write_many("m", &series(500, 0, 1)).unwrap();
     db.save(&path).unwrap();
+    let mut db = Db::open(&path).unwrap();
 
     let mut bytes = fs::read(&path).unwrap();
     let n = bytes.len();
     bytes[n - 10] ^= 0xFF;
     fs::write(&path, &bytes).unwrap();
 
-    // v3 opens from metadata only; the payload checksum is verified lazily.
-    let mut db = Db::open(&path).expect("metadata is intact");
+    let err = Db::open(&path).unwrap_err();
+    assert!(matches!(err, shrunk::Error::Format(message) if message.contains("payload checksum")));
+
+    // Existing file-backed handles still check bytes they read after open.
     let err = db.query(&Query::new("m", i64::MIN, i64::MAX)).unwrap_err();
     assert!(format!("{err}").contains("checksum"), "got: {err}");
     let copy = dir.join("copy.shrunk");
@@ -247,6 +250,40 @@ fn corrupt_payload_is_rejected() {
     assert!(!copy.exists());
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v3_open_preserves_float_edge_cases() {
+    let dir = std::env::temp_dir().join(format!("shrunk-snapshot-floats-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.shrunk");
+    let nan = f64::from_bits(0x7ff8_0000_0000_0042);
+    let cases = [
+        ("zeros", [-0.0, 0.0]),
+        ("nan", [nan, f64::NAN]),
+        ("mixed_nan", [nan, 5.0]),
+        ("infinities", [f64::NEG_INFINITY, f64::INFINITY]),
+        ("overflow", [f64::MAX, f64::MAX]),
+    ];
+    let make_points = |[a, b]: [f64; 2]| [Point::new(i64::MIN, a), Point::new(i64::MAX, b)];
+    let mut db = Db::with_block_size(2);
+    for (name, values) in cases {
+        db.write_many(name, &make_points(values)).unwrap();
+    }
+    db.save(&path).unwrap();
+
+    let reopened = Db::open(&path).unwrap();
+    for (name, values) in cases {
+        let query = Query::new(name, i64::MIN, i64::MAX);
+        assert_eq!(reopened.query(&query).unwrap().points, make_points(values));
+    }
+    let sum = reopened
+        .aggregate("overflow", i64::MIN, i64::MAX, Agg::Sum, None)
+        .unwrap();
+    assert_eq!(sum.value, Some(f64::INFINITY));
+    assert_eq!(sum.stats.blocks_decoded, 1);
+
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -375,7 +412,7 @@ fn v3_header_and_metadata_corruption_are_rejected() {
         assert!(msg.contains(needle), "expected {needle:?}, got {msg}");
     };
 
-    // v3 block metadata has its own checksum, checked without payloads.
+    // v3 block metadata has its own checksum, checked first.
     let mut b = good.clone();
     b[block_start + 2] ^= 0x01; // count
     check(&b, "header checksum");
